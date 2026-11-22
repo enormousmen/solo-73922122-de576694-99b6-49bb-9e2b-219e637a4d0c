@@ -9,11 +9,14 @@ import tempfile
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, Field
 
 from .config import Settings, load_settings
 from .store import (
+    MAX_UPSTREAMS,
     REQUIRED_KINDS,
     BuildCommittedError,
+    DependencyRejectedError,
     IncompleteBuildError,
     Store,
 )
@@ -39,10 +42,39 @@ def _check_kind(kind: str) -> str:
     return kind
 
 
+class CommitBody(BaseModel):
+    # Upstream input keys whose cached artifacts this build consumed.
+    # Omitting the field (or sending no body) reports an empty set.
+    upstreams: list[str] = Field(default_factory=list)
+
+
+def _validate_upstreams(key: str, upstreams: list[str]) -> list[str]:
+    """Structural validation of the reported upstream set."""
+    if len(upstreams) > MAX_UPSTREAMS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"too many upstream keys: {len(upstreams)} reported, "
+                f"limit is {MAX_UPSTREAMS}"
+            ),
+        )
+    for upstream in upstreams:
+        _check_name(upstream, "upstream key")
+    if len(set(upstreams)) != len(upstreams):
+        raise HTTPException(
+            status_code=422, detail="upstream keys must be unique"
+        )
+    if key in upstreams:
+        raise HTTPException(
+            status_code=422, detail="a key cannot depend on itself"
+        )
+    return upstreams
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     store = Store(settings.data_dir, quorum=settings.quorum)
-    app = FastAPI(title="firmware-cache", version="1.0.0")
+    app = FastAPI(title="firmware-cache", version="1.1.0")
     app.state.store = store
     app.state.settings = settings
 
@@ -96,11 +128,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return record
 
     @app.post("/v1/keys/{key}/builds/{build}/commit")
-    def commit_build(key: str, build: str):
+    def commit_build(key: str, build: str, body: CommitBody | None = None):
         _check_name(key, "input key")
         _check_name(build, "build id")
+        # An omitted list / empty body means the build reports no upstream
+        # dependencies (an empty set).
+        upstreams = _validate_upstreams(key, body.upstreams if body else [])
         try:
-            return store.commit_build(key, build)
+            return store.commit_build(key, build, upstreams)
         except IncompleteBuildError as exc:
             raise HTTPException(
                 status_code=409,
@@ -110,6 +145,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "required": list(REQUIRED_KINDS),
                 },
             ) from exc
+        except DependencyRejectedError as exc:
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
 
     @app.get("/v1/keys/{key}")
     def key_status(key: str):
@@ -130,7 +167,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _check_name(key, "input key")
         _check_kind(kind)
         status, path = store.hit_file(key, kind)
-        if status["status"] == "disabled":
+        # Directly disabled, or blocked through a disabled upstream: either
+        # way CI must rebuild instead of downloading cached bytes.
+        if status["status"] in ("disabled", "blocked"):
             return JSONResponse(status_code=409, content=status)
         if path is None:
             return JSONResponse(status_code=404, content=status)

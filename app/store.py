@@ -14,6 +14,21 @@ Consistency model:
 - If any two committed builds for a key differ, the key is permanently
   disabled and the differing files plus both sides' digests are recorded in
   the database, so the rebuild hint survives restarts.
+
+Upstream dependencies:
+- A commit may report the upstream input keys whose cached artifacts the
+  build consumed (at most ``MAX_UPSTREAMS``). The set reported by the first
+  successful commit of a key is fixed in the ``dependencies`` table.
+- Every build machine's first commit for that key must report the same set,
+  and every upstream must still be a hit at that moment; otherwise the commit
+  is rejected and the original records are left untouched (transaction
+  rollback). Requests omitting the list report an empty set; keys that already
+  had commits before this feature existed are treated as dependency-free.
+- When an upstream key is disabled (directly or transitively), dependent keys
+  stop serving downloads even if their own quorum was reached: status becomes
+  ``blocked`` with a rebuild hint and the dependency chain leading to the
+  disabled key. The graph is evaluated on every query from persisted rows, so
+  the same rules apply after a restart.
 """
 from __future__ import annotations
 
@@ -23,6 +38,9 @@ import sqlite3
 from contextlib import closing, contextmanager
 
 REQUIRED_KINDS = ("image", "symbols")
+
+# Maximum number of upstream input keys a single commit may report.
+MAX_UPSTREAMS = 8
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS keys (
@@ -46,6 +64,12 @@ CREATE TABLE IF NOT EXISTS files (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (input_key, build_id, kind)
 );
+CREATE TABLE IF NOT EXISTS dependencies (
+    input_key    TEXT NOT NULL,
+    upstream_key TEXT NOT NULL,
+    position     INTEGER NOT NULL,
+    PRIMARY KEY (input_key, upstream_key)
+);
 """
 
 
@@ -63,6 +87,19 @@ class IncompleteBuildError(StoreError):
     def __init__(self, missing: list[str]):
         super().__init__(f"missing files: {', '.join(missing)}")
         self.missing = missing
+
+
+class DependencyRejectedError(StoreError):
+    """Commit rejected because of the reported upstream dependency set.
+
+    Carries a structured ``detail`` payload suitable for an HTTP 409 body.
+    Nothing is written when this is raised: the surrounding transaction is
+    rolled back and all previous records are retained.
+    """
+
+    def __init__(self, error: str, message: str, **extra):
+        super().__init__(message)
+        self.detail = {"error": error, "message": message, **extra}
 
 
 @contextmanager
@@ -151,7 +188,10 @@ class Store:
 
     # ----------------------------------------------------------------- commit
 
-    def commit_build(self, key: str, build: str) -> dict:
+    def commit_build(
+        self, key: str, build: str, upstreams: list[str] | None = None
+    ) -> dict:
+        reported = list(upstreams or [])
         with closing(self._connect()) as conn, _tx(conn, immediate=True):
             row = conn.execute(
                 "SELECT committed FROM builds WHERE input_key=? AND build_id=?",
@@ -160,35 +200,92 @@ class Store:
             if row is None:
                 raise IncompleteBuildError(list(REQUIRED_KINDS))
             files = self._build_files(conn, key, build)
-            if not row["committed"]:
-                missing = [k for k in REQUIRED_KINDS if k not in files]
-                if missing:
-                    raise IncompleteBuildError(missing)
-                conn.execute(
-                    "UPDATE builds SET committed=1, committed_at=datetime('now') "
-                    "WHERE input_key=? AND build_id=?",
-                    (key, build),
-                )
-                diffs = self._detect_mismatch(conn, key)
-                if diffs is not None:
-                    conn.execute(
-                        "UPDATE keys SET disabled=1, disabled_reason=? "
-                        "WHERE input_key=?",
-                        (json.dumps(diffs), key),
+
+            if row["committed"]:
+                # Recommit is idempotent: return the original record and keep
+                # the fixed upstream set, ignoring any body the caller sent.
+                return {
+                    "input_key": key,
+                    "build_id": build,
+                    "committed": True,
+                    "files": files,
+                    "upstreams": self._fixed_upstreams(conn, key) or [],
+                    "key_status": self._effective_status(conn, key),
+                }
+
+            fixed = self._fixed_upstreams(conn, key)
+            has_committed_build = conn.execute(
+                "SELECT 1 FROM builds WHERE input_key=? AND committed=1 LIMIT 1",
+                (key,),
+            ).fetchone() is not None
+            # A key is dependency-free when it has dependency rows for the
+            # empty set (nothing to store) or committed builds predating this
+            # feature: legacy keys are treated as having no dependencies.
+            set_is_fixed = fixed is not None or has_committed_build
+            effective_fixed = fixed or []
+
+            if set_is_fixed:
+                if set(reported) != set(effective_fixed):
+                    raise DependencyRejectedError(
+                        "upstream_set_mismatch",
+                        "reported upstream set differs from the set fixed by "
+                        "the first successful commit",
+                        fixed_upstreams=effective_fixed,
+                        reported_upstreams=reported,
                     )
+                to_verify = effective_fixed
+            else:
+                to_verify = reported
+            # Every build machine's first commit for the key requires every
+            # upstream to still be a hit (which also rules out disabled or
+            # blocked upstreams), even when the set was fixed earlier.
+            for upstream in to_verify:
+                upstream_status = self._effective_status(conn, upstream)
+                if upstream_status["status"] != "hit":
+                    raise DependencyRejectedError(
+                        "upstream_not_hit",
+                        f"upstream key {upstream!r} is not a cache hit",
+                        upstream=upstream,
+                        upstream_status=upstream_status["status"],
+                    )
+
+            missing = [k for k in REQUIRED_KINDS if k not in files]
+            if missing:
+                raise IncompleteBuildError(missing)
+            conn.execute(
+                "UPDATE builds SET committed=1, committed_at=datetime('now') "
+                "WHERE input_key=? AND build_id=?",
+                (key, build),
+            )
+            if not set_is_fixed:
+                for position, upstream in enumerate(reported):
+                    conn.execute(
+                        "INSERT INTO dependencies(input_key, upstream_key, "
+                        "position) VALUES (?, ?, ?)",
+                        (key, upstream, position),
+                    )
+                effective_fixed = reported
+            diffs = self._detect_mismatch(conn, key)
+            if diffs is not None:
+                conn.execute(
+                    "UPDATE keys SET disabled=1, disabled_reason=? "
+                    "WHERE input_key=?",
+                    (json.dumps(diffs), key),
+                )
             return {
                 "input_key": key,
                 "build_id": build,
                 "committed": True,
                 "files": files,
-                "key_status": self._key_status(conn, key),
+                "upstreams": effective_fixed,
+                "key_status": self._effective_status(conn, key),
             }
 
     # ----------------------------------------------------------------- status
 
     def key_status(self, key: str) -> dict:
         with closing(self._connect()) as conn, _tx(conn):
-            return self._key_status(conn, key)
+            return self._effective_status(conn, key)
 
     def build_detail(self, key: str, build: str) -> dict | None:
         with closing(self._connect()) as conn, _tx(conn):
@@ -207,12 +304,13 @@ class Store:
                 "committed_at": row["committed_at"],
                 "files": files,
                 "missing": [k for k in REQUIRED_KINDS if k not in files],
+                "upstreams": self._fixed_upstreams(conn, key) or [],
             }
 
     def hit_file(self, key: str, kind: str) -> tuple[dict, str | None]:
-        """Return (status, blob_path). blob_path is set only on a hit."""
+        """Return (status, blob_path). blob_path is set only on a live hit."""
         with closing(self._connect()) as conn, _tx(conn):
-            status = self._key_status(conn, key)
+            status = self._effective_status(conn, key)
             if status["status"] != "hit":
                 return status, None
             sha = status["files"][kind]["sha256"]
@@ -272,7 +370,49 @@ class Store:
                     return diffs
         return None
 
-    def _key_status(self, conn, key: str) -> dict:
+    def _fixed_upstreams(self, conn, key: str) -> list[str] | None:
+        """Fixed upstream list, or None when the key has never fixed a set."""
+        rows = conn.execute(
+            "SELECT upstream_key FROM dependencies "
+            "WHERE input_key=? ORDER BY position",
+            (key,),
+        ).fetchall()
+        if not rows:
+            return None
+        return [r["upstream_key"] for r in rows]
+
+    def _find_disabled_chain(
+        self, conn, key: str, visited: set[str] | None = None
+    ) -> list[str] | None:
+        """DFS the dependency graph.
+
+        Returns the chain ``[key, ..., disabled_root]`` when a disabled key is
+        reachable through upstream edges, otherwise ``None``. The visited set
+        is defensive: a cycle cannot be created through the commit API because
+        every upstream must be a hit before the edge is stored.
+        """
+        if visited is None:
+            visited = set()
+        if key in visited:
+            return None
+        visited.add(key)
+        krow = conn.execute(
+            "SELECT disabled FROM keys WHERE input_key=?", (key,)
+        ).fetchone()
+        if krow is not None and krow["disabled"]:
+            return [key]
+        for row in conn.execute(
+            "SELECT upstream_key FROM dependencies "
+            "WHERE input_key=? ORDER BY position",
+            (key,),
+        ):
+            sub = self._find_disabled_chain(conn, row["upstream_key"], visited)
+            if sub is not None:
+                return [key] + sub
+        return None
+
+    def _base_key_status(self, conn, key: str) -> dict:
+        """Status derived from this key's own committed builds."""
         row = conn.execute(
             "SELECT disabled, disabled_reason FROM keys WHERE input_key=?", (key,)
         ).fetchone()
@@ -299,5 +439,34 @@ class Store:
         status.update(
             status="miss",
             needed=max(0, self.quorum - len(ids)),
+        )
+        return status
+
+    def _effective_status(self, conn, key: str) -> dict:
+        """Base status plus upstream-aware blocking for disabled ancestors."""
+        status = self._base_key_status(conn, key)
+        status["upstreams"] = self._fixed_upstreams(conn, key) or []
+        # A directly disabled key keeps its own detailed status.
+        if status["status"] == "disabled":
+            return status
+        chain = self._find_disabled_chain(conn, key)
+        if chain is None:
+            return status
+        root = chain[-1]
+        root_row = conn.execute(
+            "SELECT disabled_reason FROM keys WHERE input_key=?", (root,)
+        ).fetchone()
+        root_cause = {
+            "input_key": root,
+            "reason": "committed builds differ",
+        }
+        if root_row is not None and root_row["disabled_reason"] is not None:
+            root_cause["differences"] = json.loads(root_row["disabled_reason"])
+        status.update(
+            status="blocked",
+            action="rebuild",
+            reason="an upstream dependency is disabled",
+            dependency_chain=chain,
+            root_cause=root_cause,
         )
         return status
